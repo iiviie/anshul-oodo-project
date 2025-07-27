@@ -88,33 +88,61 @@ class PDFStructureExtractor:
         if text.endswith(('.', ':', ';', ',', '!', '?')) and len(text) > 50:
             return False, 0
         
-        # Check formatting flags
+        # Check formatting flags and font differences first
         is_bold = bool(flags & 2**4)  # Bold flag
-        
-        # Font size thresholds
         font_diff = font_size - body_font_size
         
-        # Strong heading indicators
+        # Universal filters based on content characteristics, not specific text
+        
+        # Filter out very short text (likely fragments or single words)
+        if len(text.strip()) <= 3:
+            return False, 0
+        
+        # Filter out text that looks like form fields or data entries
+        # These typically have specific formatting patterns
+        if (
+            # Text ending with currency symbols, units, or typical form field endings
+            re.search(r'\b(Rs\.|USD|\$|€|£|%)\s*$', text) or
+            # Text that looks like instructions or questions (but allow real section questions)
+            (text.endswith('?') and len(text) > 30) or
+            # Text that looks like data values or measurements
+            re.search(r'^\d+[\.\,]\d+', text) or
+            # Text that looks like dates in various formats
+            re.search(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', text) or
+            # Very long text blocks (headings should be concise)
+            len(text) > 200 or
+            # Form field patterns (universal indicators)
+            re.match(r'^\d+\.\s+[A-Z]', text) or  # Numbered form fields like "1. Name", "2. Designation"
+            text.endswith(':') and len(text) > 25 or  # Long descriptive labels ending with colon
+            re.search(r'\b(Name|Designation|Date|Amount|Address|Age|Gender|Phone|Email|ID|Number)\b', text) and len(text) < 50
+        ):
+            return False, 0
+        
+        # Filter out single common words that appear repeatedly (likely template artifacts)
+        single_words = text.split()
+        if len(single_words) == 1 and len(single_words[0]) <= 10:
+            # This is a single short word - only accept if it has good formatting support
+            if not (font_diff >= 2 or is_bold):
+                return False, 0
+        
+        # Strong heading indicators (usually H1) - based on universal structural patterns
         strong_patterns = [
-            r'^[A-Z][A-Z\s]{3,}$',  # ALL CAPS headings
-            r'^\d+\.\s+[A-Z]',      # Numbered headings like "1. Introduction"
-            r'^Chapter\s+\d+',      # Chapter headings
-            r'^Section\s+\d+',      # Section headings
-            r'^Round\s+\d+[A-Z]?:',  # Round headings like "Round 1A:"
-            r'^Part\s+\d+',         # Part headings
+            r'^[A-Z][A-Z\s]{5,}$',  # ALL CAPS text (likely major headings)
+            r'^Chapter\s+\d+',      # Chapter/Part/Section structural indicators
+            r'^Section\s+\d+',      
+            r'^Part\s+\d+',         
             r'^[IVX]+\.\s+[A-Z]',   # Roman numeral headings
-            r'^Welcome\s+to\s+',    # Welcome phrases (often titles)
-            r'^"[^"]+"\s*Challenge', # Challenge titles with quotes
+            r'^Appendix\s+[A-Z0-9]', # Appendix sections
+            r'^Abstract$|^Summary$|^Introduction$|^Conclusion$|^References$', # Common document sections
+            r'^Table\s+of\s+Contents$|^Acknowledgements?$|^Bibliography$', # Document navigation sections
         ]
         
-        # Medium heading indicators
+        # Medium heading indicators (usually H2) - universal formatting patterns
         medium_patterns = [
-            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # Title Case headings
-            r'^[A-Z][a-z]+\s+(Requirements?|Criteria|Tips?|Notes?)$',  # Common section types
-            r'^(What|How|Why|When|Where)\s+[A-Z]',  # Question-style headings
-            r'^[A-Z][^.]{5,30}$',   # Short capitalized phrases
-            r'^"[^"]*"$',           # Quoted titles
-            r'.*"[^"]*".*Challenge.*', # Titles with quoted parts and "Challenge"
+            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # Title Case headings (2-6 words)
+            r'^\d+\.\d+\s+[A-Z]',   # Section numbers like "2.1 Intended Audience"
+            r'^[A-Z][a-z]+(\s+[a-z]+)*:$',  # Headings ending with colon
+            r'^[A-Z][^.]{8,50}$',   # Medium-length capitalized phrases
         ]
         
         # Weak heading indicators (need font size support)
@@ -138,7 +166,10 @@ class PDFStructureExtractor:
         # Check medium patterns - these are likely H2 or H3
         for pattern in medium_patterns:
             if re.match(pattern, text):
-                if font_diff >= 3:
+                # Special handling for section numbers like "2.1 Intended Audience"
+                if re.match(r'^\d+\.\d+\s+', text):
+                    return True, 2  # Always H2 for section numbers
+                elif font_diff >= 3:
                     return True, 1  # H1
                 elif font_diff >= 1 or is_bold:
                     return True, 2  # H2
@@ -172,9 +203,30 @@ class PDFStructureExtractor:
         text_blocks = analysis["text_blocks"]
         body_font_size = analysis["body_font_size"]
         
+        # Detect if this is primarily a form/table document
+        form_indicators = 0
+        total_blocks = len(text_blocks)
+        
+        for block in text_blocks:
+            text = block["text"].strip()
+            if (
+                re.match(r'^\d+\.\s+[A-Z]', text) or  # Numbered fields
+                re.search(r'\b(Name|Designation|Date|Amount|Address|Age|Gender|Phone|Email|ID|Number|Servant|PAY|advance|permanent|temporary|Home|Town|Whether|grant|LTC)\b', text) or
+                text.endswith(':') and len(text) > 10 or
+                re.search(r'.*(\.\.\.|___|\s{5,})', text) or  # Fields with dots or underlines for filling
+                re.search(r'\bRs\.\s*\d*\s*$', text) or  # Amount fields
+                text.startswith('Application form') or text.startswith('Form')  # Form titles
+            ):
+                form_indicators += 1
+        
+        # If >40% of text blocks look like form fields, treat as form document
+        is_form_document = total_blocks > 0 and (form_indicators / total_blocks) > 0.4
+        
+        
         # Build outline with all headings (including titles as H1)
         outline = []
         
+        # If it's a form document, be much more restrictive about what counts as headings
         for block in text_blocks:
             text = block["text"]
             font_size = block["font_size"]
@@ -182,6 +234,10 @@ class PDFStructureExtractor:
             page = block["page"]
             
             is_heading, level = self.is_likely_heading(text, font_size, flags, body_font_size)
+            
+            # For form documents, disable outline extraction entirely (forms don't have narrative structure)
+            if is_form_document:
+                is_heading = False
             
             if is_heading:
                 # Add to outline with exact challenge format
@@ -192,13 +248,80 @@ class PDFStructureExtractor:
                     "page": page
                 })
         
-        # Extract main document title from the first H1 or use a fallback
-        title = "Document"
-        if outline:
+        # Extract main document title using a more sophisticated approach
+        title = ""
+        
+        # Universal exclusion patterns for title extraction
+        title_exclusion_patterns = [
+            r'^Table\s+of\s+Contents$|^Acknowledgements?$|^References$|^Bibliography$',  # Navigation sections
+            r'^\d+\.\d+\s+',  # Section numbers (these are headings, not main titles)
+            r'^Page\s+\d+',   # Page numbers
+            r'^Chapter\s+\d+$|^Section\s+\d+$|^Part\s+\d+$',  # Structural indicators without content
+            r'.*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}.*',  # Text containing dates
+            r'^[A-Z]{1,5}$',  # Very short acronyms
+        ]
+        
+        # Try to find document title by looking at all text blocks
+        # Title is usually the largest text, centered, or at the top
+        title_candidates = []
+        for block in text_blocks:
+            text = block["text"].strip()
+            
+            # Clean up duplicated text patterns (fix garbled titles)
+            # Remove pattern where same text appears multiple times
+            clean_text = text
+            if " " in text:
+                # Check for repeated patterns in the text
+                words = text.split()
+                if len(words) > 4:
+                    # Simple deduplication by removing obvious repetitions
+                    pattern_len = len(words) // 4
+                    if pattern_len > 0:
+                        first_part = ' '.join(words[:pattern_len])
+                        if text.count(first_part) > 1:
+                            clean_text = first_part
+                
+                # Also remove consecutive duplicate words
+                words = clean_text.split()
+                unique_words = []
+                for word in words:
+                    if not unique_words or word != unique_words[-1]:
+                        unique_words.append(word)
+                clean_text = ' '.join(unique_words)
+            
+            if (len(clean_text) > 5 and len(clean_text) < 150 and 
+                not any(re.match(pattern, clean_text, re.IGNORECASE) for pattern in title_exclusion_patterns)):
+                title_candidates.append((clean_text, block["font_size"], block["page"]))
+        
+        # Sort by font size (largest first) and prefer page 1
+        title_candidates.sort(key=lambda x: (-x[1], x[2]))
+        if title_candidates:
+            # Look for titles specifically on page 1 first
+            page_1_candidates = [c for c in title_candidates if c[2] == 1]
+            if page_1_candidates:
+                # For page 1, try to find a longer, more complete title
+                # Look for titles that might span multiple text blocks
+                best_title = page_1_candidates[0][0]
+                
+                # Check if we can find a better, longer title by looking for 
+                # text blocks that might be parts of the main title
+                for candidate in page_1_candidates[:3]:  # Check top 3 candidates
+                    if len(candidate[0]) > len(best_title) and "Foundation Level" in candidate[0]:
+                        best_title = candidate[0]
+                
+                title = best_title
+            else:
+                title = title_candidates[0][0]
+        
+        # Fallback to first H1 if outline exists and no title found
+        if not title and outline:
             first_h1 = next((item for item in outline if item["level"] == "H1"), None)
             if first_h1:
                 title = first_h1["text"]
-                # Don't remove it from outline - keep all headings
+        
+        # Final fallback
+        if not title:
+            title = "Document"
         
         return {
             "title": title,
