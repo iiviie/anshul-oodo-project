@@ -1,372 +1,386 @@
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import click
 import fitz
 import pdfplumber
+from collections import defaultdict, Counter
 
 
 class PDFStructureExtractor:
     def __init__(self):
         self.font_analysis = {}
+        
+        # Common document headers/footers to ignore
+        self.ignore_patterns = [
+            r'^International\s+Software\s+Testing.*Board$',
+            r'^©.*Software Testing.*Board$',
+            r'^Version\s+\d{4}.*Page\s+\d+',
+            r'^Board$',
+            r'^Qualifications\s+Board$',
+            r'^\s*Page\s+\d+\s*of\s*\d+',
+            r'^\s*\d+\s*$',  # Just page numbers
+        ]
+        
+        # Heading patterns in priority order
         self.heading_patterns = [
-            r'^[A-Z][A-Z\s]{2,}$',  # ALL CAPS headings
-            r'^\d+\.\s+[A-Z]',      # Numbered headings like "1. Introduction"
-            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # Title Case headings
-            r'^Chapter\s+\d+',      # Chapter headings
-            r'^Section\s+\d+',      # Section headings
-            r'^Round\s+\d+',        # Round headings
+            # Very strong indicators
+            (r'^Chapter\s+\d+[\.:]\s*(.+)', 'chapter', 1),
+            (r'^Section\s+\d+[\.:]\s*(.+)', 'section', 1),
+            (r'^Part\s+\d+[\.:]\s*(.+)', 'part', 1),
+            (r'^Appendix\s+[A-Z][\.:]\s*(.+)', 'appendix', 1),
+            
+            # Numbered sections
+            (r'^(\d+)\.\s+([A-Z].+)$', 'numbered_main', 1),
+            (r'^(\d+\.\d+)\s+([A-Z].+)$', 'numbered_sub', 2),
+            (r'^(\d+\.\d+\.\d+)\s+([A-Z].+)$', 'numbered_subsub', 3),
+            
+            # Special sections
+            (r'^(Executive\s+Summary|Abstract|Introduction|Conclusion|References|Bibliography|Acknowledgements?)$', 'special', 1),
+            (r'^(Table\s+of\s+Contents|Revision\s+History|Glossary|Index)$', 'special', 1),
+            
+            # All caps (but not too short)
+            (r'^[A-Z][A-Z\s\-&]{4,}$', 'allcaps', 2),
+            
+            # Title case 
+            (r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*:?$', 'titlecase', 3),
+        ]
+        
+        # Form field indicators
+        self.form_indicators = [
+            r'^\d+\.\s*(Name|Date|Designation|Address|Phone|Email|Age|Gender)\b',
+            r'\b(Name|Date|Amount|Address|Signature)\s*:?\s*$',
+            r'.*\.\.\.\s*$',
+            r'.*___+\s*$',
+            r'\bRs\.\s*\d*\s*$',
+            r'^Whether\s+',
+            r'^\s*\d+\.\s*$',  # Just numbers with period
         ]
     
     def analyze_document_structure(self, pdf_path: str) -> Dict[str, Any]:
+        """Analyze PDF structure and extract font statistics and text blocks."""
         doc = fitz.open(pdf_path)
         
-        font_stats = {}
+        font_stats = defaultdict(lambda: {'count': 0, 'total_chars': 0, 'blocks': []})
         text_blocks = []
+        page_count = len(doc)
         
-        for page_num in range(len(doc)):
+        for page_num in range(page_count):
             page = doc[page_num]
             blocks = page.get_text("dict")["blocks"]
             
             for block in blocks:
                 if "lines" in block:
-                    block_text = ""
-                    block_font_sizes = []
-                    block_flags = []
-                    
-                    for line in block["lines"]:
-                        line_text = ""
-                        for span in line["spans"]:
-                            text = span["text"].strip()
-                            if text:
-                                line_text += text + " "
-                                block_font_sizes.append(span["size"])
-                                block_flags.append(span["flags"])
-                                
-                                font_key = (span["size"], span["flags"])
-                                font_stats[font_key] = font_stats.get(font_key, 0) + len(text)
+                    block_info = self._process_text_block(block, page_num)
+                    if block_info:
+                        text_blocks.append(block_info)
                         
-                        if line_text.strip():
-                            block_text += line_text.strip() + " "
-                    
-                    if block_text.strip():
-                        avg_font_size = sum(block_font_sizes) / len(block_font_sizes) if block_font_sizes else 12
-                        most_common_flag = max(set(block_flags), key=block_flags.count) if block_flags else 0
-                        
-                        text_blocks.append({
-                            "text": block_text.strip(),
-                            "page": page_num + 1,
-                            "font_size": avg_font_size,
-                            "flags": most_common_flag,
-                            "length": len(block_text.strip()),
-                            "bbox": block.get("bbox", [0, 0, 0, 0])
-                        })
+                        # Track font usage
+                        font_key = (round(block_info["font_size"], 1), block_info["flags"])
+                        font_stats[font_key]['count'] += 1
+                        font_stats[font_key]['total_chars'] += block_info["length"]
+                        font_stats[font_key]['blocks'].append(block_info["text"][:50])
         
         doc.close()
         
-        # Determine font hierarchy
-        font_sizes = [stats[0] for stats in font_stats.keys()]
-        sorted_sizes = sorted(set(font_sizes), reverse=True)
-        
-        # Get the most common (body text) font size
-        body_font_size = max(font_stats.keys(), key=font_stats.get)[0]
+        # Analyze fonts
+        font_analysis = self._analyze_fonts(font_stats)
         
         return {
             "text_blocks": text_blocks,
-            "font_hierarchy": sorted_sizes,
-            "body_font_size": body_font_size,
-            "font_stats": font_stats
+            "font_analysis": font_analysis,
+            "page_count": page_count
         }
     
-    def is_likely_heading(self, text: str, font_size: float, flags: int, body_font_size: float) -> tuple:
-        # Skip very long text blocks - headings are typically shorter
+    def _process_text_block(self, block: Dict, page_num: int) -> Optional[Dict]:
+        """Process a single text block and extract its properties."""
+        block_text = ""
+        font_sizes = []
+        font_flags = []
+        
+        for line in block["lines"]:
+            line_text = ""
+            for span in line["spans"]:
+                text = span["text"].strip()
+                if text:
+                    line_text += text + " "
+                    font_sizes.append(span["size"])
+                    font_flags.append(span["flags"])
+            
+            if line_text.strip():
+                block_text += line_text.strip() + " "
+        
+        block_text = block_text.strip()
+        
+        # Skip empty or very short blocks
+        if not block_text or len(block_text) < 2:
+            return None
+        
+        # Skip if matches ignore patterns
+        if any(re.match(pattern, block_text) for pattern in self.ignore_patterns):
+            return None
+        
+        avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 12
+        most_common_flag = Counter(font_flags).most_common(1)[0][0] if font_flags else 0
+        
+        return {
+            "text": block_text,
+            "page": page_num + 1,
+            "font_size": avg_font_size,
+            "flags": most_common_flag,
+            "length": len(block_text),
+            "bbox": block.get("bbox", [0, 0, 0, 0]),
+            "y_pos": block.get("bbox", [0, 0, 0, 0])[1]
+        }
+    
+    def _analyze_fonts(self, font_stats: Dict) -> Dict[str, Any]:
+        """Analyze font statistics to determine body text and heading fonts."""
+        if not font_stats:
+            return {"body_font_size": 12, "heading_fonts": []}
+        
+        # Find body font (most characters)
+        body_font = max(font_stats.items(), key=lambda x: x[1]['total_chars'])[0]
+        body_font_size = body_font[0]
+        
+        # Find potential heading fonts (larger than body)
+        heading_fonts = []
+        for font_key, stats in font_stats.items():
+            font_size = font_key[0]
+            if font_size > body_font_size and stats['count'] > 1:
+                heading_fonts.append({
+                    'size': font_size,
+                    'flags': font_key[1],
+                    'diff': font_size - body_font_size
+                })
+        
+        heading_fonts.sort(key=lambda x: x['size'], reverse=True)
+        
+        return {
+            "body_font_size": body_font_size,
+            "heading_fonts": heading_fonts
+        }
+    
+    def is_form_document(self, text_blocks: List[Dict]) -> bool:
+        """Detect if this is primarily a form document."""
+        if not text_blocks:
+            return False
+        
+        # Check for form title
+        for block in text_blocks[:10]:
+            text_lower = block["text"].lower()
+            if 'application form' in text_lower or 'form for' in text_lower:
+                return True
+        
+        # Count form field indicators
+        form_field_count = 0
+        for block in text_blocks[:30]:  # Check first 30 blocks
+            text = block["text"]
+            if any(re.match(pattern, text, re.IGNORECASE) for pattern in self.form_indicators):
+                form_field_count += 1
+        
+        # If more than 30% look like form fields, it's likely a form
+        return form_field_count > len(text_blocks[:30]) * 0.3
+    
+    def extract_title(self, text_blocks: List[Dict], is_form: bool) -> str:
+        """Extract the document title."""
+        candidates = []
+        
+        # For forms, look for "form" in the text
+        if is_form:
+            for block in text_blocks[:20]:
+                text = block["text"]
+                if 'form' in text.lower() and len(text) < 100:
+                    return text
+        
+        # Look for title candidates in first few blocks
+        for i, block in enumerate(text_blocks[:30]):
+            text = block["text"].strip()
+            
+            # Skip common non-titles
+            if any(pattern in text.lower() for pattern in [
+                'page ', 'version ', 'copyright', 'table of contents',
+                'revision history', 'acknowledgements', 'www.', 'http'
+            ]):
+                continue
+            
+            # Skip dates
+            if re.match(r'^[A-Z][a-z]+\s+\d+,\s+\d{4}$', text):
+                continue
+            
+            # Skip if too short or too long
+            if len(text) < 5 or len(text) > 200:
+                continue
+            
+            # Score the candidate
+            score = 0
+            
+            # Position score
+            if i < 5:
+                score += 5 - i
+            
+            # Font size score
+            score += block["font_size"] / 10
+            
+            # Page 1 bonus
+            if block["page"] == 1:
+                score += 3
+            
+            # Upper page bonus
+            if block["y_pos"] < 300:
+                score += 2
+            
+            # Length preference
+            if 10 <= len(text) <= 80:
+                score += 2
+            
+            candidates.append((text, score, block))
+        
+        if not candidates:
+            return "Document"
+        
+        # Sort by score
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        
+        # For party invitations, check for specific patterns
+        top_text = candidates[0][0]
+        if any(word in top_text.upper() for word in ['PARTY', 'INVITED', 'INVITATION']):
+            # Look for a better title that's not just a field
+            for text, score, block in candidates:
+                if 'INVITED' in text.upper() and 'YOU' in text.upper():
+                    return text
+                elif 'PARTY' in text.upper() and not text.endswith(':'):
+                    return text
+        
+        return candidates[0][0]
+    
+    def is_heading(self, text: str, font_size: float, flags: int, 
+                   body_font_size: float, is_form: bool) -> Tuple[bool, int]:
+        """Determine if text is a heading and its level."""
+        text = text.strip()
+        
+        # Never treat form fields as headings in form documents
+        if is_form:
+            return False, 0
+        
+        # Skip if matches ignore patterns
+        if any(re.match(pattern, text) for pattern in self.ignore_patterns):
+            return False, 0
+        
+        # Skip very long text
         if len(text) > 150:
             return False, 0
         
-        # Skip text that ends with common sentence endings
-        if text.endswith(('.', ':', ';', ',', '!', '?')) and len(text) > 50:
+        # Skip dates
+        if re.match(r'^[A-Z][a-z]+\s+\d+,\s+\d{4}$', text):
             return False, 0
         
-        # Check formatting flags and font differences first
-        is_bold = bool(flags & 2**4)  # Bold flag
+        # Check font properties
         font_diff = font_size - body_font_size
+        is_bold = bool(flags & 2**4)
         
-        # Universal filters based on content characteristics, not specific text
-        
-        # Filter out very short text (likely fragments or single words)
-        if len(text.strip()) <= 3:
-            return False, 0
-        
-        # Filter out text that looks like form fields or data entries
-        # These typically have specific formatting patterns
-        if (
-            # Text ending with currency symbols, units, or typical form field endings
-            re.search(r'\b(Rs\.|USD|\$|€|£|%)\s*$', text) or
-            # Text that looks like instructions or questions (but allow real section questions)
-            (text.endswith('?') and len(text) > 30) or
-            # Text that looks like data values or measurements
-            re.search(r'^\d+[\.\,]\d+', text) or
-            # Text that looks like dates in various formats
-            re.search(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b', text) or
-            # Very long text blocks (headings should be concise)
-            len(text) > 200 or
-            # Form field patterns (universal indicators)
-            re.match(r'^\d+\.\s+[A-Z]', text) or  # Numbered form fields like "1. Name", "2. Designation"
-            text.endswith(':') and len(text) > 25 or  # Long descriptive labels ending with colon
-            re.search(r'\b(Name|Designation|Date|Amount|Address|Age|Gender|Phone|Email|ID|Number)\b', text) and len(text) < 50
-        ):
-            return False, 0
-        
-        # Filter out single common words that appear repeatedly (likely template artifacts)
-        single_words = text.split()
-        if len(single_words) == 1 and len(single_words[0]) <= 10:
-            # This is a single short word - only accept if it has good formatting support
-            if not (font_diff >= 2 or is_bold):
-                return False, 0
-        
-        # Strong heading indicators (usually H1) - based on universal structural patterns
-        strong_patterns = [
-            r'^[A-Z][A-Z\s]{5,}$',  # ALL CAPS text (likely major headings)
-            r'^Chapter\s+\d+',      # Chapter/Part/Section structural indicators
-            r'^Section\s+\d+',      
-            r'^Part\s+\d+',         
-            r'^[IVX]+\.\s+[A-Z]',   # Roman numeral headings
-            r'^Appendix\s+[A-Z0-9]', # Appendix sections
-            r'^Abstract$|^Summary$|^Introduction$|^Conclusion$|^References$', # Common document sections
-            r'^Table\s+of\s+Contents$|^Acknowledgements?$|^Bibliography$', # Document navigation sections
-        ]
-        
-        # Medium heading indicators (usually H2) - universal formatting patterns
-        medium_patterns = [
-            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # Title Case headings (2-6 words)
-            r'^\d+\.\d+\s+[A-Z]',   # Section numbers like "2.1 Intended Audience"
-            r'^[A-Z][a-z]+(\s+[a-z]+)*:$',  # Headings ending with colon
-            r'^[A-Z][^.]{8,50}$',   # Medium-length capitalized phrases
-        ]
-        
-        # Weak heading indicators (need font size support)
-        weak_patterns = [
-            r'^•\s+[A-Z]',          # Bullet points that might be sub-headings
-            r'^o\s+[A-Z]',          # Sub-bullet points
-            r'^\d+\)\s+[A-Z]',      # Numbered list items
-            r'^[a-z]\)\s+[A-Z]',    # Lettered list items
-        ]
-        
-        # Check strong patterns - these are likely H1 or H2
-        for pattern in strong_patterns:
-            if re.match(pattern, text):
-                if font_diff >= 4:
-                    return True, 1  # H1
-                elif font_diff >= 1 or is_bold:
-                    return True, 2  # H2
-                else:
-                    return True, 3  # H3
-        
-        # Check medium patterns - these are likely H2 or H3
-        for pattern in medium_patterns:
-            if re.match(pattern, text):
-                # Special handling for section numbers like "2.1 Intended Audience"
-                if re.match(r'^\d+\.\d+\s+', text):
-                    return True, 2  # Always H2 for section numbers
-                elif font_diff >= 3:
-                    return True, 1  # H1
-                elif font_diff >= 1 or is_bold:
-                    return True, 2  # H2
-                else:
-                    return True, 3  # H3
-        
-        # Check weak patterns - need font size or bold support
-        for pattern in weak_patterns:
-            if re.match(pattern, text) and (font_diff >= 1 or is_bold):
-                return True, 3  # H3
-        
-        # General title case check with font size
-        words = text.split()
-        if (len(words) <= 10 and 
-            len(words) >= 2 and
-            all(word[0].isupper() if word and word[0].isalpha() else True for word in words) and
-            not text.endswith('.') and
-            (font_diff >= 1 or is_bold)):
-            
-            if font_diff >= 4:
-                return True, 1  # H1
-            elif font_diff >= 2:
-                return True, 2  # H2
-            else:
-                return True, 3  # H3
+        # Check heading patterns
+        for pattern, pattern_type, default_level in self.heading_patterns:
+            match = re.match(pattern, text)
+            if match:
+                # Determine level based on pattern and font
+                if pattern_type in ['chapter', 'part', 'special']:
+                    return True, 1
+                elif pattern_type == 'numbered_main':
+                    return True, 1
+                elif pattern_type == 'numbered_sub':
+                    return True, 2
+                elif pattern_type == 'numbered_subsub':
+                    return True, 3
+                elif pattern_type == 'appendix':
+                    # Check font to determine if H1 or H3
+                    if font_diff >= 4:
+                        return True, 1
+                    else:
+                        return True, 3
+                elif pattern_type == 'allcaps':
+                    # Use font size to determine level
+                    if font_diff >= 4:
+                        return True, 1
+                    elif font_diff >= 2 or is_bold:
+                        return True, 2
+                    else:
+                        return True, 3
+                elif pattern_type == 'titlecase':
+                    # Only consider if font is larger or bold
+                    if font_diff >= 2 or is_bold:
+                        if font_diff >= 4:
+                            return True, 1
+                        elif font_diff >= 2:
+                            return True, 2
+                        else:
+                            return True, 3
         
         return False, 0
     
-    def extract_text_with_structure(self, pdf_path: str) -> Dict[str, Any]:
-        analysis = self.analyze_document_structure(pdf_path)
-        text_blocks = analysis["text_blocks"]
-        body_font_size = analysis["body_font_size"]
+    def extract_outline(self, text_blocks: List[Dict], body_font_size: float, 
+                       is_form: bool, title: str) -> List[Dict]:
+        """Extract document outline."""
+        outline = []
+        seen_texts = set()
         
-        # Detect if this is primarily a form/table document
-        form_indicators = 0
-        total_blocks = len(text_blocks)
+        # Don't extract outline for forms
+        if is_form:
+            return []
         
         for block in text_blocks:
             text = block["text"].strip()
-            if (
-                re.match(r'^\d+\.\s+[A-Z]', text) or  # Numbered fields
-                re.search(r'\b(Name|Designation|Date|Amount|Address|Age|Gender|Phone|Email|ID|Number|Servant|PAY|advance|permanent|temporary|Home|Town|Whether|grant|LTC)\b', text) or
-                text.endswith(':') and len(text) > 10 or
-                re.search(r'.*(\.\.\.|___|\s{5,})', text) or  # Fields with dots or underlines for filling
-                re.search(r'\bRs\.\s*\d*\s*$', text) or  # Amount fields
-                text.startswith('Application form') or text.startswith('Form')  # Form titles
-            ):
-                form_indicators += 1
-        
-        # If >40% of text blocks look like form fields, treat as form document
-        is_form_document = total_blocks > 0 and (form_indicators / total_blocks) > 0.4
-        
-        
-        # Build outline with all headings (including titles as H1)
-        outline = []
-        
-        # If it's a form document, be much more restrictive about what counts as headings
-        for block in text_blocks:
-            text = block["text"]
-            font_size = block["font_size"]
-            flags = block["flags"]
-            page = block["page"]
             
-            is_heading, level = self.is_likely_heading(text, font_size, flags, body_font_size)
+            # Skip if we've seen this exact text before
+            if text in seen_texts:
+                continue
             
-            # For form documents, disable outline extraction entirely (forms don't have narrative structure)
-            if is_form_document:
-                is_heading = False
+            # Skip if it's the same as the title
+            if text == title:
+                continue
+            
+            is_heading, level = self.is_heading(
+                text, 
+                block["font_size"], 
+                block["flags"],
+                body_font_size,
+                is_form
+            )
             
             if is_heading:
-                # Add to outline with exact challenge format
-                level_str = f"H{level}"
-                outline.append({
-                    "level": level_str,
+                outline_entry = {
+                    "level": f"H{level}",
                     "text": text,
-                    "page": page
-                })
+                    "page": block["page"]
+                }
+                outline.append(outline_entry)
+                seen_texts.add(text)
         
-        # Extract main document title using a more sophisticated approach
-        title = ""
+        return outline
+    
+    def extract_pdf_data(self, pdf_path: str) -> Dict[str, Any]:
+        """Main extraction method."""
+        # Analyze document
+        analysis = self.analyze_document_structure(pdf_path)
+        text_blocks = analysis["text_blocks"]
+        font_analysis = analysis["font_analysis"]
         
-        # Universal exclusion patterns for title extraction
-        title_exclusion_patterns = [
-            r'^Table\s+of\s+Contents$|^Acknowledgements?$|^References$|^Bibliography$',  # Navigation sections
-            r'^\d+\.\d+\s+',  # Section numbers (these are headings, not main titles)
-            r'^Page\s+\d+',   # Page numbers
-            r'^Chapter\s+\d+$|^Section\s+\d+$|^Part\s+\d+$',  # Structural indicators without content
-            r'.*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}.*',  # Text containing dates
-            r'^[A-Z]{1,5}$',  # Very short acronyms
-        ]
+        if not text_blocks:
+            return {"title": "Document", "outline": []}
         
-        # Try to find document title by looking at all text blocks
-        # Title is usually the largest text, centered, or at the top
-        title_candidates = []
-        for block in text_blocks:
-            text = block["text"].strip()
-            
-            # Clean up duplicated text patterns (fix garbled titles)
-            # Remove pattern where same text appears multiple times
-            clean_text = text
-            if " " in text:
-                # Check for repeated patterns in the text
-                words = text.split()
-                if len(words) > 4:
-                    # Simple deduplication by removing obvious repetitions
-                    pattern_len = len(words) // 4
-                    if pattern_len > 0:
-                        first_part = ' '.join(words[:pattern_len])
-                        if text.count(first_part) > 1:
-                            clean_text = first_part
-                
-                # Also remove consecutive duplicate words
-                words = clean_text.split()
-                unique_words = []
-                for word in words:
-                    if not unique_words or word != unique_words[-1]:
-                        unique_words.append(word)
-                clean_text = ' '.join(unique_words)
-            
-            if (len(clean_text) > 5 and len(clean_text) < 150 and 
-                not any(re.match(pattern, clean_text, re.IGNORECASE) for pattern in title_exclusion_patterns)):
-                title_candidates.append((clean_text, block["font_size"], block["page"]))
+        # Detect document type
+        is_form = self.is_form_document(text_blocks)
         
-        # Sort by font size (largest first) and prefer page 1
-        title_candidates.sort(key=lambda x: (-x[1], x[2]))
-        if title_candidates:
-            # Look for titles specifically on page 1 first
-            page_1_candidates = [c for c in title_candidates if c[2] == 1]
-            if page_1_candidates:
-                # For page 1, try to find a longer, more complete title
-                # Look for titles that might span multiple text blocks
-                best_title = page_1_candidates[0][0]
-                
-                # Check if we can find a better, longer title by looking for 
-                # text blocks that might be parts of the main title
-                for candidate in page_1_candidates[:3]:  # Check top 3 candidates
-                    if len(candidate[0]) > len(best_title) and "Foundation Level" in candidate[0]:
-                        best_title = candidate[0]
-                
-                title = best_title
-            else:
-                title = title_candidates[0][0]
+        # Extract title
+        title = self.extract_title(text_blocks, is_form)
         
-        # Fallback to first H1 if outline exists and no title found
-        if not title and outline:
-            first_h1 = next((item for item in outline if item["level"] == "H1"), None)
-            if first_h1:
-                title = first_h1["text"]
-        
-        # Final fallback
-        if not title:
-            title = "Document"
+        # Extract outline
+        body_font_size = font_analysis["body_font_size"]
+        outline = self.extract_outline(text_blocks, body_font_size, is_form, title)
         
         return {
             "title": title,
             "outline": outline
-        }
-    
-    def extract_tables_and_data(self, pdf_path: str) -> List[Dict[str, Any]]:
-        tables = []
-        
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                page_tables = page.extract_tables()
-                
-                for table_num, table in enumerate(page_tables):
-                    if table and len(table) > 1:
-                        headers = table[0] if table[0] else [f"Column_{i}" for i in range(len(table[1]))]
-                        rows = table[1:]
-                        
-                        table_data = {
-                            "page": page_num + 1,
-                            "table_number": table_num + 1,
-                            "headers": headers,
-                            "rows": rows,
-                            "structured_data": []
-                        }
-                        
-                        for row in rows:
-                            if row and any(cell for cell in row if cell):
-                                row_dict = {}
-                                for i, cell in enumerate(row):
-                                    header = headers[i] if i < len(headers) else f"Column_{i}"
-                                    row_dict[header] = cell if cell else ""
-                                table_data["structured_data"].append(row_dict)
-                        
-                        tables.append(table_data)
-        
-        return tables
-    
-    def extract_pdf_data(self, pdf_path: str) -> Dict[str, Any]:
-        structured_text = self.extract_text_with_structure(pdf_path)
-        
-        # Return in the exact format specified by the challenge
-        return {
-            "title": structured_text["title"],
-            "outline": structured_text["outline"]
         }
 
 
@@ -375,7 +389,8 @@ class PDFStructureExtractor:
 @click.option('--output', '-o', type=click.Path(path_type=Path), 
               help='Output JSON file path (default: input_filename.json)')
 @click.option('--pretty', '-p', is_flag=True, help='Pretty print JSON output')
-def main(pdf_path: Path, output: Optional[Path], pretty: bool):
+@click.option('--debug', '-d', is_flag=True, help='Show debug information')
+def main(pdf_path: Path, output: Optional[Path], pretty: bool, debug: bool):
     """Extract structured data from PDF files and output as JSON."""
     
     if not pdf_path.suffix.lower() == '.pdf':
@@ -391,16 +406,26 @@ def main(pdf_path: Path, output: Optional[Path], pretty: bool):
         extractor = PDFStructureExtractor()
         extracted_data = extractor.extract_pdf_data(str(pdf_path))
         
+        if debug:
+            click.echo(f"Document title: {extracted_data['title']}")
+            click.echo(f"Found {len(extracted_data['outline'])} headings")
+            if len(extracted_data['outline']) > 0:
+                click.echo("\nOutline preview:")
+                for item in extracted_data['outline'][:5]:
+                    click.echo(f"  {item['level']}: {item['text'][:50]}...")
+        
         indent = 2 if pretty else None
         
         with open(output, 'w', encoding='utf-8') as f:
             json.dump(extracted_data, f, indent=indent, ensure_ascii=False)
         
-        click.echo(f"Extraction complete! Output saved to: {output}")
-        click.echo(f"Found {len(extracted_data['outline'])} headings")
+        click.echo(f"✓ Extraction complete! Output saved to: {output}")
         
     except Exception as e:
         click.echo(f"Error extracting PDF data: {e}", err=True)
+        if debug:
+            import traceback
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
